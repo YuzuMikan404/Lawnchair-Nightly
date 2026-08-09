@@ -20,3 +20,7 @@ Obtainiumの追加時に、
 - 変わっていれば、そのAPKをダウンロードして
   `nightly-YYYYMMDD-HHMMSS` というタグで新規リリースを作成（JST）
 - 変わっていなければ何もしない(APIを叩くだけなので軽い)
+
+## 謝辞
+
+https://github.com/LawnchairLauncher/lawnchair
