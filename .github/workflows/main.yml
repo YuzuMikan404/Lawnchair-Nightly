@@ -63,15 +63,17 @@ jobs:
           ts=$(date -u +"%Y%m%d-%H%M%S")
           tag="nightly-${ts}"
 
+          notes="Lawnchairの nightly リリースから自動ミラーしました。
+
+          元のアセット: ${{ steps.latest.outputs.asset_name }}
+          SHA256: ${{ steps.latest.outputs.digest }}
+          元コミット: ${{ steps.latest.outputs.commit }}
+          検知時刻(UTC): ${ts}"
+
           gh release create "$tag" \
             "downloads/${{ steps.latest.outputs.asset_name }}" \
             --title "Lawnchair Nightly Mirror ${ts}" \
-            --notes "Lawnchairの nightly リリースから自動ミラーしました。
-
-元のアセット: ${{ steps.latest.outputs.asset_name }}
-SHA256: ${{ steps.latest.outputs.digest }}
-元コミット: ${{ steps.latest.outputs.commit }}
-検知時刻(UTC): ${ts}"
+            --notes "$notes"
 
       - name: Save new digest for next comparison
         if: steps.compare.outputs.changed == 'true'
