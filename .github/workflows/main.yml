@@ -1,0 +1,85 @@
+name: Mirror Lawnchair Nightly
+
+on:
+  schedule:
+    # 1時間おきにチェック(必要に応じて変更してください)
+    - cron: '0 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  check-and-mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get latest Lawnchair nightly release info
+        id: latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          response=$(gh api repos/LawnchairLauncher/lawnchair/releases/tags/nightly)
+
+          # APKアセットだけを抽出(複数あるかもしれないので最初の1件)
+          asset_name=$(echo "$response" | jq -r '[.assets[] | select(.name | test("\\.apk$"))][0].name')
+          asset_url=$(echo "$response" | jq -r '[.assets[] | select(.name | test("\\.apk$"))][0].browser_download_url')
+          digest=$(echo "$response" | jq -r '[.assets[] | select(.name | test("\\.apk$"))][0].digest')
+          commit=$(echo "$response" | jq -r '.target_commitish')
+          published_at=$(echo "$response" | jq -r '.assets[0].updated_at')
+
+          echo "asset_name=$asset_name" >> "$GITHUB_OUTPUT"
+          echo "asset_url=$asset_url" >> "$GITHUB_OUTPUT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "published_at=$published_at" >> "$GITHUB_OUTPUT"
+
+      - name: Compare with last known digest
+        id: compare
+        run: |
+          last=""
+          if [ -f state/last_digest.txt ]; then
+            last=$(cat state/last_digest.txt)
+          fi
+          echo "changed=$([ "$last" != "${{ steps.latest.outputs.digest }}" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: Download new APK
+        if: steps.compare.outputs.changed == 'true'
+        run: |
+          mkdir -p downloads
+          curl -L -o "downloads/${{ steps.latest.outputs.asset_name }}" "${{ steps.latest.outputs.asset_url }}"
+
+      - name: Create timestamped release in this repo
+        if: steps.compare.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          ts=$(date -u +"%Y%m%d-%H%M%S")
+          tag="nightly-${ts}"
+
+          gh release create "$tag" \
+            "downloads/${{ steps.latest.outputs.asset_name }}" \
+            --title "Lawnchair Nightly Mirror ${ts}" \
+            --notes "Lawnchairの nightly リリースから自動ミラーしました。
+
+元のアセット: ${{ steps.latest.outputs.asset_name }}
+SHA256: ${{ steps.latest.outputs.digest }}
+元コミット: ${{ steps.latest.outputs.commit }}
+検知時刻(UTC): ${ts}"
+
+      - name: Save new digest for next comparison
+        if: steps.compare.outputs.changed == 'true'
+        run: |
+          mkdir -p state
+          echo "${{ steps.latest.outputs.digest }}" > state/last_digest.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state/last_digest.txt
+          git commit -m "chore: update last mirrored digest [skip ci]"
+          git push
