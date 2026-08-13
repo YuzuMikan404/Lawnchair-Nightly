@@ -2,6 +2,7 @@ name: Mirror Lawnchair Nightly
 
 on:
   schedule:
+    # 1時間おきにチェック(必要に応じて変更してください)
     - cron: '0 * * * *'
   workflow_dispatch: {}
 
@@ -22,8 +23,24 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set +e
+          response=""
+          for i in 1 2 3 4 5; do
+            response=$(gh api repos/LawnchairLauncher/lawnchair/releases/tags/nightly 2>&1)
+            if [ $? -eq 0 ]; then
+              break
+            fi
+            echo "::warning::取得に失敗しました(試行 ${i}/5): $response"
+            response=""
+            sleep 15
+          done
+
+          if [ -z "$response" ]; then
+            echo "::warning::LawnchairのnightlyリリースAPIから取得できませんでした。Lawnchair側でリリースを削除→再作成している最中の可能性があります。今回は処理をスキップします。"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           set -e
-          response=$(gh api repos/LawnchairLauncher/lawnchair/releases/tags/nightly)
 
           # APKアセットだけを抽出(複数あるかもしれないので最初の1件)
           asset_name=$(echo "$response" | jq -r '[.assets[] | select(.name | test("\\.apk$"))][0].name')
@@ -33,6 +50,13 @@ jobs:
           release_url=$(echo "$response" | jq -r '.html_url')
           published_at=$(echo "$response" | jq -r '.assets[0].updated_at')
 
+          if [ -z "$asset_name" ] || [ "$asset_name" == "null" ]; then
+            echo "::warning::レスポンスにAPKアセットが見つかりませんでした。今回は処理をスキップします。"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "skip=false" >> "$GITHUB_OUTPUT"
           echo "asset_name=$asset_name" >> "$GITHUB_OUTPUT"
           echo "asset_url=$asset_url" >> "$GITHUB_OUTPUT"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
@@ -42,6 +66,7 @@ jobs:
 
       - name: Compare with last known digest
         id: compare
+        if: steps.latest.outputs.skip != 'true'
         run: |
           last=""
           if [ -f state/last_digest.txt ]; then
