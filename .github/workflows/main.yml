@@ -22,10 +22,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      # ============================================================
-      # Upstream Nightly
-      # ============================================================
-
       - name: Get latest Lawnchair nightly
         id: latest
         env:
@@ -36,16 +32,13 @@ jobs:
           response=""
 
           for i in 1 2 3 4 5; do
-            response=$(gh api \
-              repos/LawnchairLauncher/lawnchair/releases/tags/nightly \
-              2>&1)
+            response=$(gh api repos/LawnchairLauncher/lawnchair/releases/tags/nightly 2>&1)
 
             if [ $? -eq 0 ]; then
               break
             fi
 
             echo "::warning::Failed to fetch nightly (${i}/5): $response"
-
             response=""
             sleep 15
           done
@@ -83,10 +76,6 @@ jobs:
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
           echo "release_url=$release_url" >> "$GITHUB_OUTPUT"
 
-      # ============================================================
-      # State
-      # ============================================================
-
       - name: Check whether APK was already tested
         id: compare
         if: steps.latest.outputs.skip != 'true'
@@ -99,10 +88,8 @@ jobs:
 
           if [ "$last_seen" = "${{ steps.latest.outputs.digest }}" ]; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "This APK has already been tested."
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "New APK detected."
           fi
 
       - name: Verify baseline exists
@@ -110,16 +97,8 @@ jobs:
         run: |
           if [ ! -s state/last_good_tag.txt ]; then
             echo "::error::state/last_good_tag.txt does not exist."
-            echo "::error::Initialize the known-good release manually."
             exit 1
           fi
-
-          echo "Known-good release:"
-          cat state/last_good_tag.txt
-
-      # ============================================================
-      # Download
-      # ============================================================
 
       - name: Download candidate APK
         if: steps.compare.outputs.changed == 'true'
@@ -154,13 +133,6 @@ jobs:
             exit 1
           fi
 
-          echo "Baseline APK:"
-          echo "$baseline_apk"
-
-      # ============================================================
-      # Android Emulator
-      # ============================================================
-
       - name: Enable KVM
         if: steps.compare.outputs.changed == 'true'
         run: |
@@ -170,13 +142,11 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
-      # ============================================================
-      # Upgrade Smoke Test
-      # ============================================================
-
       - name: Test APK upgrade
         if: steps.compare.outputs.changed == 'true'
         uses: reactivecircus/android-emulator-runner@v2
+        env:
+          CANDIDATE_NAME: ${{ steps.latest.outputs.asset_name }}
         with:
           api-level: 35
           arch: x86_64
@@ -190,144 +160,7 @@ jobs:
             -no-boot-anim
             -camera-back none
 
-          script: |
-           set -u
-
-            PACKAGE="app.lawnchair"
-
-            BASELINE_APK=$(find baseline -maxdepth 1 -name '*.apk' | head -n 1)
-            CANDIDATE_APK="candidate/${{ steps.latest.outputs.asset_name }}"
-
-            FAILED=false
-
-            # ------------------------------------------------------
-            # Install known-good version
-            # ------------------------------------------------------
-
-            echo "Installing known-good APK..."
-
-            adb install "$BASELINE_APK"
-
-            # Establish existing application state before upgrade.
-            adb shell monkey \
-              -p "$PACKAGE" \
-              -c android.intent.category.LAUNCHER \
-              1 || true
-
-            sleep 10
-
-            # ------------------------------------------------------
-            # Upgrade
-            # ------------------------------------------------------
-
-            echo "Installing candidate APK as an update..."
-
-            adb install -r "$CANDIDATE_APK"
-
-            adb logcat -c
-
-            adb shell am force-stop "$PACKAGE"
-
-            # ------------------------------------------------------
-            # Launch updated Lawnchair
-            # ------------------------------------------------------
-
-            echo "Launching updated Lawnchair..."
-
-            adb shell monkey \
-              -p "$PACKAGE" \
-              -c android.intent.category.LAUNCHER \
-              1 || true
-
-            # Give startup crashes / ANRs time to occur.
-            sleep 30
-
-            # ------------------------------------------------------
-            # Process check
-            # ------------------------------------------------------
-
-            PID=$(adb shell pidof "$PACKAGE" || true)
-
-            if [ -z "$PID" ]; then
-              echo "::error::Lawnchair process is not running."
-              FAILED=true
-            else
-              echo "Lawnchair PID: $PID"
-            fi
-
-            # ------------------------------------------------------
-            # Logs
-            # ------------------------------------------------------
-
-            adb logcat -d > logcat.txt
-
-            adb shell dumpsys activity processes \
-              > activity-processes.txt || true
-
-            adb shell dumpsys activity activities \
-              > activity-activities.txt || true
-
-            # ------------------------------------------------------
-            # Crash / ANR detection
-            # ------------------------------------------------------
-
-            if grep -E -i \
-              "ANR in app\.lawnchair|Application Not Responding|Input dispatching timed out|FATAL EXCEPTION|Process: app\.lawnchair|Fatal signal|DeadSystemException|OutOfMemoryError" \
-              logcat.txt; then
-
-              echo "::error::Crash or ANR detected."
-              FAILED=true
-            fi
-
-            # ------------------------------------------------------
-            # Basic interaction
-            # ------------------------------------------------------
-
-            adb shell input keyevent KEYCODE_HOME || true
-            sleep 3
-
-            adb shell input swipe \
-              500 1200 \
-              500 400 \
-              300 || true
-
-            sleep 5
-
-            # ------------------------------------------------------
-            # Final process check
-            # ------------------------------------------------------
-
-            PID=$(adb shell pidof "$PACKAGE" || true)
-
-            if [ -z "$PID" ]; then
-              echo "::error::Lawnchair process died during interaction."
-              FAILED=true
-            fi
-
-            # Capture any errors produced during interaction.
-            adb logcat -d > logcat-final.txt
-
-            if grep -E -i \
-              "ANR in app\.lawnchair|Application Not Responding|Input dispatching timed out|FATAL EXCEPTION|Process: app\.lawnchair|Fatal signal|DeadSystemException|OutOfMemoryError" \
-              logcat-final.txt; then
-
-              echo "::error::Crash or ANR detected after interaction."
-              FAILED=true
-            fi
-
-            # ------------------------------------------------------
-            # Result
-            # ------------------------------------------------------
-
-            if [ "$FAILED" = "true" ]; then
-              echo "failed" > smoke-result.txt
-            else
-              echo "passed" > smoke-result.txt
-            fi
-
-      # ============================================================
-      # Diagnostics
-      # ============================================================
+          script: bash ./scripts/smoke-test.sh
 
       - name: Upload diagnostics
         if: steps.compare.outputs.changed == 'true'
@@ -349,18 +182,10 @@ jobs:
         run: |
           if [ -f smoke-result.txt ] &&
              grep -q '^passed$' smoke-result.txt; then
-
             echo "passed=true" >> "$GITHUB_OUTPUT"
-
           else
-
             echo "passed=false" >> "$GITHUB_OUTPUT"
-
           fi
-
-      # ============================================================
-      # Release
-      # ============================================================
 
       - name: Create release
         id: release
@@ -400,20 +225,14 @@ jobs:
 
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
-      # ============================================================
-      # Persist State
-      # ============================================================
-
       - name: Save state
         if: steps.compare.outputs.changed == 'true'
         run: |
           mkdir -p state
 
-          # Regardless of pass/fail, remember that we tested it.
           echo "${{ steps.latest.outputs.digest }}" \
             > state/last_seen_digest.txt
 
-          # Only a successfully released APK becomes the next baseline.
           if [ "${{ steps.result.outputs.passed }}" = "true" ]; then
             echo "${{ steps.release.outputs.tag }}" \
               > state/last_good_tag.txt
@@ -429,14 +248,8 @@ jobs:
             exit 0
           fi
 
-          git commit \
-            -m "chore: update nightly validation state [skip ci]"
-
+          git commit -m "chore: update nightly validation state [skip ci]"
           git push
-
-      # ============================================================
-      # Reject
-      # ============================================================
 
       - name: Reject failed candidate
         if: >
