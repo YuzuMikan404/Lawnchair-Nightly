@@ -191,7 +191,7 @@ jobs:
             -camera-back none
 
           script: |
-            set -uo pipefail
+           set -u
 
             PACKAGE="app.lawnchair"
 
