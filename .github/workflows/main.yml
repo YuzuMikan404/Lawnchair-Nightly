@@ -143,6 +143,7 @@ jobs:
           sudo udevadm trigger --name-match=kvm
 
       - name: Test APK upgrade
+        id: smoke
         if: steps.compare.outputs.changed == 'true'
         uses: reactivecircus/android-emulator-runner@v2
         env:
@@ -163,7 +164,7 @@ jobs:
           script: bash ./scripts/smoke-test.sh
 
       - name: Upload diagnostics
-        if: steps.compare.outputs.changed == 'true'
+        if: always() && steps.compare.outputs.changed == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: lawnchair-smoke-test-${{ github.run_id }}
@@ -174,13 +175,16 @@ jobs:
             logcat-final.txt
             activity-processes.txt
             activity-activities.txt
+            window.txt
+            package.txt
             smoke-result.txt
 
       - name: Read test result
         id: result
-        if: steps.compare.outputs.changed == 'true'
+        if: always() && steps.compare.outputs.changed == 'true'
         run: |
-          if [ -f smoke-result.txt ] &&
+          if [ "${{ steps.smoke.outcome }}" = "success" ] &&
+             [ -f smoke-result.txt ] &&
              grep -q '^passed$' smoke-result.txt; then
             echo "passed=true" >> "$GITHUB_OUTPUT"
           else
@@ -226,7 +230,9 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Save state
-        if: steps.compare.outputs.changed == 'true'
+        if: >
+          steps.compare.outputs.changed == 'true' &&
+          steps.smoke.outcome == 'success'
         run: |
           mkdir -p state
 
@@ -253,6 +259,7 @@ jobs:
 
       - name: Reject failed candidate
         if: >
+          always() &&
           steps.compare.outputs.changed == 'true' &&
           steps.result.outputs.passed != 'true'
         run: |
