@@ -2,56 +2,76 @@ name: Mirror Lawnchair Nightly
 
 on:
   schedule:
-    # 1時間おきにチェック(必要に応じて変更してください)
     - cron: '0 * * * *'
   workflow_dispatch: {}
 
 permissions:
   contents: write
 
+concurrency:
+  group: lawnchair-nightly-mirror
+  cancel-in-progress: false
+
 jobs:
   check-and-mirror:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout this repo
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Get latest Lawnchair nightly release info
+      # ============================================================
+      # Upstream Nightly
+      # ============================================================
+
+      - name: Get latest Lawnchair nightly
         id: latest
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set +e
+
           response=""
+
           for i in 1 2 3 4 5; do
-            response=$(gh api repos/LawnchairLauncher/lawnchair/releases/tags/nightly 2>&1)
+            response=$(gh api \
+              repos/LawnchairLauncher/lawnchair/releases/tags/nightly \
+              2>&1)
+
             if [ $? -eq 0 ]; then
               break
             fi
-            echo "::warning::取得に失敗しました(試行 ${i}/5): $response"
+
+            echo "::warning::Failed to fetch nightly (${i}/5): $response"
+
             response=""
             sleep 15
           done
 
           if [ -z "$response" ]; then
-            echo "::warning::LawnchairのnightlyリリースAPIから取得できませんでした。Lawnchair側でリリースを削除→再作成している最中の可能性があります。今回は処理をスキップします。"
+            echo "::warning::Unable to fetch Lawnchair nightly."
             echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+
           set -e
 
-          # APKアセットだけを抽出(複数あるかもしれないので最初の1件)
-          asset_name=$(echo "$response" | jq -r '[.assets[] | select(.name | test("\\.apk$"))][0].name')
-          asset_url=$(echo "$response" | jq -r '[.assets[] | select(.name | test("\\.apk$"))][0].browser_download_url')
-          digest=$(echo "$response" | jq -r '[.assets[] | select(.name | test("\\.apk$"))][0].digest')
+          asset_name=$(echo "$response" | jq -r \
+            '[.assets[] | select(.name | test("\\.apk$"))][0].name')
+
+          asset_url=$(echo "$response" | jq -r \
+            '[.assets[] | select(.name | test("\\.apk$"))][0].browser_download_url')
+
+          digest=$(echo "$response" | jq -r \
+            '[.assets[] | select(.name | test("\\.apk$"))][0].digest')
+
           commit=$(echo "$response" | jq -r '.target_commitish')
           release_url=$(echo "$response" | jq -r '.html_url')
-          published_at=$(echo "$response" | jq -r '.assets[0].updated_at')
 
-          if [ -z "$asset_name" ] || [ "$asset_name" == "null" ]; then
-            echo "::warning::レスポンスにAPKアセットが見つかりませんでした。今回は処理をスキップします。"
+          if [ -z "$asset_name" ] || [ "$asset_name" = "null" ]; then
+            echo "::warning::No APK asset found."
             echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -62,36 +82,310 @@ jobs:
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
           echo "release_url=$release_url" >> "$GITHUB_OUTPUT"
-          echo "published_at=$published_at" >> "$GITHUB_OUTPUT"
 
-      - name: Compare with last known digest
+      # ============================================================
+      # State
+      # ============================================================
+
+      - name: Check whether APK was already tested
         id: compare
         if: steps.latest.outputs.skip != 'true'
         run: |
-          last=""
-          if [ -f state/last_digest.txt ]; then
-            last=$(cat state/last_digest.txt)
-          fi
-          echo "changed=$([ "$last" != "${{ steps.latest.outputs.digest }}" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          last_seen=""
 
-      - name: Download new APK
+          if [ -f state/last_seen_digest.txt ]; then
+            last_seen=$(cat state/last_seen_digest.txt)
+          fi
+
+          if [ "$last_seen" = "${{ steps.latest.outputs.digest }}" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "This APK has already been tested."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "New APK detected."
+          fi
+
+      - name: Verify baseline exists
         if: steps.compare.outputs.changed == 'true'
         run: |
-          mkdir -p downloads
-          curl -L -o "downloads/${{ steps.latest.outputs.asset_name }}" "${{ steps.latest.outputs.asset_url }}"
+          if [ ! -s state/last_good_tag.txt ]; then
+            echo "::error::state/last_good_tag.txt does not exist."
+            echo "::error::Initialize the known-good release manually."
+            exit 1
+          fi
 
-      - name: Create timestamped release in this repo
+          echo "Known-good release:"
+          cat state/last_good_tag.txt
+
+      # ============================================================
+      # Download
+      # ============================================================
+
+      - name: Download candidate APK
+        if: steps.compare.outputs.changed == 'true'
+        run: |
+          mkdir -p candidate
+
+          curl \
+            --fail \
+            --location \
+            --retry 3 \
+            --retry-delay 5 \
+            --output "candidate/${{ steps.latest.outputs.asset_name }}" \
+            "${{ steps.latest.outputs.asset_url }}"
+
+      - name: Download last known-good APK
         if: steps.compare.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -e
-          now_epoch=$(date -u +%s)
-          ts=$(TZ='Asia/Tokyo' date -d "@${now_epoch}" +"%Y%m%d-%H%M%S")
-          tag="nightly-${ts}"
-          ts_jst=$(TZ='Asia/Tokyo' date -d "@${now_epoch}" +"%Y-%m-%d %H:%M:%S %Z")
+          tag=$(cat state/last_good_tag.txt)
 
-          notes="Lawnchairの nightly リリースから自動ミラーしました。
+          mkdir -p baseline
+
+          gh release download "$tag" \
+            --pattern "*.apk" \
+            --dir baseline
+
+          baseline_apk=$(find baseline -maxdepth 1 -name '*.apk' | head -n 1)
+
+          if [ -z "$baseline_apk" ]; then
+            echo "::error::Unable to find known-good APK."
+            exit 1
+          fi
+
+          echo "Baseline APK:"
+          echo "$baseline_apk"
+
+      # ============================================================
+      # Android Emulator
+      # ============================================================
+
+      - name: Enable KVM
+        if: steps.compare.outputs.changed == 'true'
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      # ============================================================
+      # Upgrade Smoke Test
+      # ============================================================
+
+      - name: Test APK upgrade
+        if: steps.compare.outputs.changed == 'true'
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          profile: pixel_6
+          disable-animations: true
+
+          emulator-options: >-
+            -no-snapshot
+            -no-window
+            -no-audio
+            -no-boot-anim
+            -camera-back none
+
+          script: |
+            set -uo pipefail
+
+            PACKAGE="app.lawnchair"
+
+            BASELINE_APK=$(find baseline -maxdepth 1 -name '*.apk' | head -n 1)
+            CANDIDATE_APK="candidate/${{ steps.latest.outputs.asset_name }}"
+
+            FAILED=false
+
+            # ------------------------------------------------------
+            # Install known-good version
+            # ------------------------------------------------------
+
+            echo "Installing known-good APK..."
+
+            adb install "$BASELINE_APK"
+
+            # Establish existing application state before upgrade.
+            adb shell monkey \
+              -p "$PACKAGE" \
+              -c android.intent.category.LAUNCHER \
+              1 || true
+
+            sleep 10
+
+            # ------------------------------------------------------
+            # Upgrade
+            # ------------------------------------------------------
+
+            echo "Installing candidate APK as an update..."
+
+            adb install -r "$CANDIDATE_APK"
+
+            adb logcat -c
+
+            adb shell am force-stop "$PACKAGE"
+
+            # ------------------------------------------------------
+            # Launch updated Lawnchair
+            # ------------------------------------------------------
+
+            echo "Launching updated Lawnchair..."
+
+            adb shell monkey \
+              -p "$PACKAGE" \
+              -c android.intent.category.LAUNCHER \
+              1 || true
+
+            # Give startup crashes / ANRs time to occur.
+            sleep 30
+
+            # ------------------------------------------------------
+            # Process check
+            # ------------------------------------------------------
+
+            PID=$(adb shell pidof "$PACKAGE" || true)
+
+            if [ -z "$PID" ]; then
+              echo "::error::Lawnchair process is not running."
+              FAILED=true
+            else
+              echo "Lawnchair PID: $PID"
+            fi
+
+            # ------------------------------------------------------
+            # Logs
+            # ------------------------------------------------------
+
+            adb logcat -d > logcat.txt
+
+            adb shell dumpsys activity processes \
+              > activity-processes.txt || true
+
+            adb shell dumpsys activity activities \
+              > activity-activities.txt || true
+
+            # ------------------------------------------------------
+            # Crash / ANR detection
+            # ------------------------------------------------------
+
+            if grep -E -i \
+              "ANR in app\.lawnchair|Application Not Responding|Input dispatching timed out|FATAL EXCEPTION|Process: app\.lawnchair|Fatal signal|DeadSystemException|OutOfMemoryError" \
+              logcat.txt; then
+
+              echo "::error::Crash or ANR detected."
+              FAILED=true
+            fi
+
+            # ------------------------------------------------------
+            # Basic interaction
+            # ------------------------------------------------------
+
+            adb shell input keyevent KEYCODE_HOME || true
+            sleep 3
+
+            adb shell input swipe \
+              500 1200 \
+              500 400 \
+              300 || true
+
+            sleep 5
+
+            # ------------------------------------------------------
+            # Final process check
+            # ------------------------------------------------------
+
+            PID=$(adb shell pidof "$PACKAGE" || true)
+
+            if [ -z "$PID" ]; then
+              echo "::error::Lawnchair process died during interaction."
+              FAILED=true
+            fi
+
+            # Capture any errors produced during interaction.
+            adb logcat -d > logcat-final.txt
+
+            if grep -E -i \
+              "ANR in app\.lawnchair|Application Not Responding|Input dispatching timed out|FATAL EXCEPTION|Process: app\.lawnchair|Fatal signal|DeadSystemException|OutOfMemoryError" \
+              logcat-final.txt; then
+
+              echo "::error::Crash or ANR detected after interaction."
+              FAILED=true
+            fi
+
+            # ------------------------------------------------------
+            # Result
+            # ------------------------------------------------------
+
+            if [ "$FAILED" = "true" ]; then
+              echo "failed" > smoke-result.txt
+            else
+              echo "passed" > smoke-result.txt
+            fi
+
+      # ============================================================
+      # Diagnostics
+      # ============================================================
+
+      - name: Upload diagnostics
+        if: steps.compare.outputs.changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: lawnchair-smoke-test-${{ github.run_id }}
+          retention-days: 14
+          if-no-files-found: ignore
+          path: |
+            logcat.txt
+            logcat-final.txt
+            activity-processes.txt
+            activity-activities.txt
+            smoke-result.txt
+
+      - name: Read test result
+        id: result
+        if: steps.compare.outputs.changed == 'true'
+        run: |
+          if [ -f smoke-result.txt ] &&
+             grep -q '^passed$' smoke-result.txt; then
+
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+
+          else
+
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+
+          fi
+
+      # ============================================================
+      # Release
+      # ============================================================
+
+      - name: Create release
+        id: release
+        if: >
+          steps.compare.outputs.changed == 'true' &&
+          steps.result.outputs.passed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+
+          now_epoch=$(date -u +%s)
+
+          ts=$(TZ='Asia/Tokyo' \
+            date -d "@${now_epoch}" +"%Y%m%d-%H%M%S")
+
+          ts_jst=$(TZ='Asia/Tokyo' \
+            date -d "@${now_epoch}" +"%Y-%m-%d %H:%M:%S %Z")
+
+          tag="nightly-${ts}"
+
+          notes="Lawnchair の nightly リリースから自動ミラーしました。
+
+          Android Emulator 上で、前回の正常版から
+          このバージョンへのアップデートテストに成功しています。
 
           元のアセット: ${{ steps.latest.outputs.asset_name }}
           SHA256: ${{ steps.latest.outputs.digest }}
@@ -100,17 +394,55 @@ jobs:
           検知時刻(JST): ${ts_jst}"
 
           gh release create "$tag" \
-            "downloads/${{ steps.latest.outputs.asset_name }}" \
+            "candidate/${{ steps.latest.outputs.asset_name }}" \
             --title "Lawnchair Nightly Mirror ${ts}" \
             --notes "$notes"
 
-      - name: Save new digest for next comparison
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      # ============================================================
+      # Persist State
+      # ============================================================
+
+      - name: Save state
         if: steps.compare.outputs.changed == 'true'
         run: |
           mkdir -p state
-          echo "${{ steps.latest.outputs.digest }}" > state/last_digest.txt
+
+          # Regardless of pass/fail, remember that we tested it.
+          echo "${{ steps.latest.outputs.digest }}" \
+            > state/last_seen_digest.txt
+
+          # Only a successfully released APK becomes the next baseline.
+          if [ "${{ steps.result.outputs.passed }}" = "true" ]; then
+            echo "${{ steps.release.outputs.tag }}" \
+              > state/last_good_tag.txt
+          fi
+
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add state/last_digest.txt
-          git commit -m "chore: update last mirrored digest [skip ci]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add state/
+
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+
+          git commit \
+            -m "chore: update nightly validation state [skip ci]"
+
           git push
+
+      # ============================================================
+      # Reject
+      # ============================================================
+
+      - name: Reject failed candidate
+        if: >
+          steps.compare.outputs.changed == 'true' &&
+          steps.result.outputs.passed != 'true'
+        run: |
+          echo "::error::Candidate APK failed the smoke test."
+          echo "::error::Release was NOT created."
+          exit 1
