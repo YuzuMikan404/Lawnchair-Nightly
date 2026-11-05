@@ -204,12 +204,12 @@ jobs:
           now_epoch=$(date -u +%s)
 
           ts=$(TZ='Asia/Tokyo' \
-            date -d "@${now_epoch}" +"%Y%m%d-%H%M%S")
+            date -d "@${now_epoch}" +"%Y.%m.%d.%H%M")
 
           ts_jst=$(TZ='Asia/Tokyo' \
             date -d "@${now_epoch}" +"%Y-%m-%d %H:%M:%S %Z")
 
-          tag="nightly-${ts}"
+          tag="${ts}"
 
           notes="Lawnchair の nightly リリースから自動ミラーしました。
 

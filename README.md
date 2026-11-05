@@ -16,9 +16,9 @@ Obtainiumの追加時に、
 ## 仕組み
 
 - 元の `nightly` リリースのAPKアセットの `digest`(SHA256)を毎回取得
-- 前回保存した値(`state/last_digest.txt`)と比較
+- 前回保存した値(`state/last_seen_digest.txt`)と比較
 - 変わっていれば、そのAPKをダウンロードして
-  `nightly-YYYYMMDD-HHMMSS` というタグで新規リリースを作成（JST）
+  `YYYY.MM.DD.HHmm` というタグ（例: `2026.11.05.1347`）で新規リリースを作成（JST）
 - 変わっていなければ何もしない(APIを叩くだけなので軽い)
 
 ## 謝辞
